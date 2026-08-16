@@ -361,8 +361,19 @@ class DDHTSaveVideoSingleFile:
                 os.remove(audio_path)
 
         relative_path = Path(subfolder, output_name).as_posix() if subfolder else output_name
+        preview = {
+            "filename": output_name,
+            "subfolder": subfolder,
+            "type": "output",
+            "format": format,
+            "frame_rate": int(frame_rate),
+            "fullpath": output_path,
+        }
         return {
-            "ui": {"text": [f"Saved one video file: {relative_path}"]},
+            "ui": {
+                "text": [f"Saved one video file: {relative_path}"],
+                "gifs": [preview],
+            },
             "result": (output_path,),
         }
 
