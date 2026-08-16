@@ -28,6 +28,20 @@
 
 如果图片来自 VideoHelperSuite 的 Load Video，请把其 `loaded_fps` 连接到本节点的 `source_fps`。
 
+### 文本长度门控 - DDHT
+
+检查输入文本的字符长度，只允许合理长度的 LLM 输出继续传递到下游节点。
+
+- `text`：需要检查的文本，可连接其他节点的 `STRING` 输出。
+- `min_length`：允许的最小字符数。
+- `max_length`：允许的最大字符数。
+- 范围包含最小值和最大值。
+- 合格时原样输出文本，同时输出实际字符数。
+- 过短或过长时使用 ComfyUI 的 `ExecutionBlocker` 停止全部下游执行。
+- 如果旧版 ComfyUI 不支持 `ExecutionBlocker`，会抛出明确错误并终止当前工作流。
+
+字符数使用 Python Unicode 字符计数，空格、换行和标点也会计入长度。
+
 ## 安装
 
 ```bash

@@ -22,6 +22,14 @@ import torch
 import folder_paths
 from comfy.utils import ProgressBar
 
+try:
+    from comfy_execution.graph import ExecutionBlocker
+except ImportError:
+    try:
+        from comfy_execution.graph_utils import ExecutionBlocker
+    except ImportError:
+        ExecutionBlocker = None
+
 
 CATEGORY = "DDHT/Video"
 
@@ -361,12 +369,69 @@ class DDHTExtractFramesByFPS:
         return (selected, int(selected.shape[0]))
 
 
+class DDHTTextLengthGate:
+    """Pass text through only when its character count is inside a range."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "text": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "multiline": True,
+                        "forceInput": True,
+                    },
+                ),
+                "min_length": (
+                    "INT",
+                    {"default": 1, "min": 0, "max": 10000000, "step": 1},
+                ),
+                "max_length": (
+                    "INT",
+                    {"default": 4000, "min": 0, "max": 10000000, "step": 1},
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("STRING", "INT")
+    RETURN_NAMES = ("text", "character_count")
+    FUNCTION = "check_length"
+    CATEGORY = "DDHT/Text"
+
+    def check_length(self, text: str, min_length: int, max_length: int):
+        if min_length > max_length:
+            raise ValueError(
+                f"Invalid text length range: min_length ({min_length}) is greater than "
+                f"max_length ({max_length})."
+            )
+
+        if not isinstance(text, str):
+            text = str(text)
+        character_count = len(text)
+
+        if min_length <= character_count <= max_length:
+            return (text, character_count)
+
+        reason = (
+            f"Text length gate stopped downstream execution: {character_count} characters "
+            f"is outside the inclusive range {min_length} to {max_length}."
+        )
+        if ExecutionBlocker is not None:
+            blocker = ExecutionBlocker(reason)
+            return (blocker, blocker)
+        raise RuntimeError(reason)
+
+
 NODE_CLASS_MAPPINGS = {
     "DDHT_SaveVideoSingleFile": DDHTSaveVideoSingleFile,
     "DDHT_ExtractFramesByFPS": DDHTExtractFramesByFPS,
+    "DDHT_TextLengthGate": DDHTTextLengthGate,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "DDHT_SaveVideoSingleFile": "保存视频（仅一个文件）- DDHT",
     "DDHT_ExtractFramesByFPS": "按每秒帧数抽帧 - DDHT",
+    "DDHT_TextLengthGate": "文本长度门控 - DDHT",
 }
