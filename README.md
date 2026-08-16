@@ -42,6 +42,33 @@
 
 字符数使用 Python Unicode 字符计数，空格、换行和标点也会计入长度。
 
+### 局域网多模态 LLM 推理 - DDHT
+
+通过 HTTP 调用局域网中已经启动的本地大模型服务。ComfyUI 只负责整理提示词、压缩图片、发送请求和接收流式结果，不在节点进程中重复加载模型。
+
+- 支持 `llama.cpp`、`Ollama`、`vLLM`、`SGLang` 和通用 OpenAI 兼容接口。
+- 支持纯文本推理，也支持最多 8 个 `IMAGE` 输入端口。
+- 初始只显示一个图片端口；连接后自动增加下一个端口，最多 8 个。
+- 每个图片端口都可以接收完整批次，节点会按端口顺序展开。
+- 图片总数超过 `最大图片数` 时，会在全部图片中均匀抽取，默认最多发送 24 张。
+- 图片仅在内存中缩放并压缩为 JPEG，不创建临时图片文件。
+- 支持 SSE（OpenAI 兼容）和 NDJSON（Ollama）流式输出，可响应 ComfyUI 的中断操作。
+- 达到字符上限时可选择立即报错终止，或断开生成连接后返回截断文本。
+- 输出生成文本、返回字符数，以及包含 token 用量、图片数和结束原因的 JSON。
+
+常用地址示例：
+
+| 框架 | `API地址` 示例 | 节点实际调用 |
+|---|---|---|
+| llama.cpp | `http://192.168.1.20:8080` | `/v1/chat/completions` |
+| Ollama | `http://192.168.1.20:11434` | `/api/chat` |
+| vLLM | `http://192.168.1.20:8000` | `/v1/chat/completions` |
+| SGLang | `http://192.168.1.20:30000` | `/v1/chat/completions` |
+
+也可以直接填写完整的 `/v1/chat/completions` 或 `/api/chat` 地址。使用 Ollama 时，`模型名称` 必须是服务中已经拉取的视觉模型名称。其他框架同样需要加载支持图片输入的模型，纯文本模型无法处理图片。
+
+如服务需要密钥，请先在启动 ComfyUI 的系统环境中设置密钥，再把环境变量的名称填入 `API密钥环境变量`。不要直接把密钥写进工作流。`高级参数JSON` 可添加框架特有参数，但不能覆盖节点生成的 `messages` 和 `stream`。
+
 ## 安装
 
 ```bash
@@ -51,7 +78,7 @@ cd ComfyUI-ddht-anynode
 pip install -r requirements.txt
 ```
 
-安装后重启 ComfyUI，在 `DDHT/Video` 分类中寻找节点。
+安装后重启 ComfyUI。视频节点位于 `DDHT/Video`，文本门控位于 `DDHT/Text`，本地大模型节点位于 `DDHT/LLM`。
 
 ## 说明
 
