@@ -8,21 +8,23 @@
 
 把 `IMAGE` 图片序列编码为 MP4，可选连接 ComfyUI `AUDIO`。
 
+- `frame_rate` 使用整数输入。
 - 有音频时只保存最终的有声 MP4。
 - 无音频时只保存最终的无声 MP4。
 - 不额外保存首帧 PNG。
 - 不生成或保留无声中间视频。
-- 支持 H.264 与 H.265，默认 H.264。
+- 输出格式与 `pix_fmt` 对齐 VideoHelperSuite：支持 `video/h264-mp4` 与 `video/h265-mp4`；切换格式时会使用对应的像素格式顺序和 CRF 默认值。
 - 音频编码为 AAC；短音频会补静音，长音频会裁切到视频长度。
+- 兼容普通 ComfyUI `AUDIO` 字典和 VideoHelperSuite Load Video 输出的惰性音频对象；连接了无效音频时会明确报错，不再静默保存无声文件。
 
-`quality` 是 FFmpeg CRF：数值越低质量越高、文件越大，默认 `18`。
+`quality` 是 FFmpeg CRF：数值越低质量越高、文件越大。与 VideoHelperSuite 一致，H.264 默认 `19`，H.265 默认 `22`。
 
 ### 按每秒帧数抽帧 - DDHT
 
 输入一个 ComfyUI `IMAGE` 批次，根据原始帧率和目标抽帧率均匀输出较小的图片序列，适合提交给视觉 LLM 分析视频。
 
 - `source_fps`：输入图片序列的实际帧率。
-- `extract_fps`：每秒希望保留多少帧。
+- `extract_fps`：每秒希望保留多少帧，使用整数输入。
 - 输出抽取后的 `IMAGE` 批次和实际帧数。
 - 当目标帧率不低于原始帧率时，直接返回全部帧，不生成重复帧。
 
