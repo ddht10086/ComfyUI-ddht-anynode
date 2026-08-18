@@ -90,6 +90,8 @@ pip install -r requirements.txt
 
 本项目的功能设计参考了 [ComfyUI-VideoHelperSuite](https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite)，并针对单文件输出和按时间均匀抽帧进行了独立实现。
 
+局域网多模态 LLM 推理节点参考了 [comfyUI-llama-TE](https://github.com/tl2012tl/comfyUI-llama-TE) 的 Qwen 多模态推理设计；本项目的局域网 HTTP 调用、多框架适配、动态图片端口及 SSE/NDJSON 流式处理为独立实现。
+
 ## License
 
 GNU General Public License v3.0。详见 [LICENSE](LICENSE)。
