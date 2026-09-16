@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 import { app } from "../../scripts/app.js";
 
-const TARGET_NODE = "DDHT_LocalLLMInference";
+const TARGET_NODES = new Set(["DDHT_LocalLLMInference", "DDHT_DeepSeekAPI"]);
 const MAX_IMAGE_INPUTS = 8;
 const IMAGE_INPUT_PATTERN = /^图片([1-8])$/;
 
@@ -66,7 +66,7 @@ function scheduleReconcile(node) {
 app.registerExtension({
     name: "DDHT.DynamicLocalLLMImageInputs",
     async beforeRegisterNodeDef(nodeType, nodeData) {
-        if (nodeData.name !== TARGET_NODE) return;
+        if (!TARGET_NODES.has(nodeData.name)) return;
 
         const originalOnNodeCreated = nodeType.prototype.onNodeCreated;
         nodeType.prototype.onNodeCreated = function (...args) {
@@ -97,4 +97,3 @@ app.registerExtension({
         };
     },
 });
-
