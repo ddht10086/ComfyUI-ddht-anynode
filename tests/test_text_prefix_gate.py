@@ -147,7 +147,7 @@ class TextPrefixGateTests(unittest.TestCase):
     def test_package_entry_registers_node_and_preserves_other_mappings(self):
         package_name = "ddht_prefix_package_test"
         stubs = {}
-        for name in ("clip_management", "deepseek_api", "nodes", "local_llm", "sla_attention"):
+        for name in ("clip_management", "deepseek_api", "folder_images", "nodes", "local_llm", "sla_attention"):
             stub = types.ModuleType(f"{package_name}.{name}")
             stub.NODE_CLASS_MAPPINGS = {name: object()}
             stub.NODE_DISPLAY_NAME_MAPPINGS = {name: name}
@@ -161,7 +161,7 @@ class TextPrefixGateTests(unittest.TestCase):
         with patch.dict(sys.modules, stubs):
             package_spec.loader.exec_module(package)
         self.assertIs(package.NODE_CLASS_MAPPINGS["DDHT_TextPrefixGate"], Node)
-        self.assertEqual(len(package.NODE_CLASS_MAPPINGS), 6)
+        self.assertEqual(len(package.NODE_CLASS_MAPPINGS), 7)
         self.assertEqual(package.WEB_DIRECTORY, "./web")
 
 
