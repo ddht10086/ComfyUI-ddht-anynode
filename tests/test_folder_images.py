@@ -76,6 +76,10 @@ class FolderImageTests(unittest.TestCase):
         self.assertEqual(required["读取方式"][1]["default"], "随机")
         self.assertTrue(required["seed"][1]["control_after_generate"])
         self.assertFalse(required["填充透明区域"][1]["default"])
+        self.assertEqual(list(required), ["文件夹路径", "读取方式", "seed", "包含子文件夹",
+                                         "顺序起始索引", "顺序重置标记", "填充透明区域", "填充颜色"])
+        self.assertEqual(Node.INPUT_TYPES()["optional"]["随机重置标记"][0], "INT")
+        self.assertEqual(Node.INPUT_TYPES()["optional"]["随机重置标记"][1]["default"], 0)
         self.assertTrue(Node.OUTPUT_NODE)
         self.assertTrue(math.isnan(Node.IS_CHANGED()))
         self.assertEqual(Node.RETURN_TYPES[:2], ("IMAGE", "MASK"))
@@ -101,15 +105,141 @@ class FolderImageTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "没有支持的图片"):
             self.load()
 
-    def test_random_reproducibility_and_global_rng_is_untouched(self):
+    def test_random_playlist_covers_each_file_once_per_round(self):
         for index in range(7):
             self.make_image(f"{index}.png")
         state = random.getstate()
-        outputs = [self.load(seed=1234) for _ in range(3)]
-        self.assertEqual({out["result"][4] for out in outputs}, {random.Random(1234).randrange(7)})
+        outputs = [self.load(seed=1234) for _ in range(35)]
+        indices = [out["result"][4] for out in outputs]
+        for start in range(0, len(indices), 7):
+            self.assertEqual(sorted(indices[start:start + 7]), list(range(7)))
+        self.assertTrue(all(left != right for left, right in zip(indices, indices[1:])))
+        self.assertGreater(len({tuple(indices[start:start + 7]) for start in range(0, 35, 7)}), 1)
+        for out in outputs:
+            self.assertEqual(out["result"][2], f'{out["result"][4]}.png')
+            self.assertEqual(out["result"][5], 7)
         self.assertEqual(state, random.getstate())
-        self.assertEqual(len({self.load(seed=seed)["result"][4] for seed in range(12)}) > 1, True)
         self.assertNotEqual(self.preview(outputs[0]), self.preview(outputs[1]))
+
+    def test_fixed_seed_reproduces_full_playlist_in_independent_nodes(self):
+        for index in range(6):
+            self.make_image(f"{index}.png")
+        first = [self.load(seed=8765)["result"][4] for _ in range(18)]
+        # A new object starts its own sequence, regardless of another node's position.
+        other = Node()
+        second = [other.load_image(str(self.folder), seed=8765)["result"][4] for _ in range(18)]
+        self.assertEqual(first, second)
+        different = Node()
+        third = [different.load_image(str(self.folder), seed=12)["result"][4] for _ in range(6)]
+        self.assertNotEqual(first[:6], third)
+
+    def test_randomize_seed_does_not_replace_an_unfinished_playlist(self):
+        for index in range(5):
+            self.make_image(f"{index}.png")
+        reference = Node()
+        expected = [reference.load_image(str(self.folder), seed=42)["result"][4] for _ in range(5)]
+        actual = [self.load(seed=42 + index * 100)["result"][4] for index in range(5)]
+        self.assertEqual(actual, expected)
+        for round_number in range(1, 4):
+            following = [self.load(seed=round_number * 1000 + index)["result"][4] for index in range(5)]
+            self.assertEqual(sorted(following), list(range(5)))
+            self.assertNotEqual(actual[-1], following[0])
+            actual = following
+
+    def test_single_image_and_two_image_playlists(self):
+        self.make_image("1.png")
+        self.assertEqual([self.load(seed=i)["result"][4] for i in range(5)], [0] * 5)
+        self.make_image("2.png")
+        outputs = [self.load(seed=i)["result"][4] for i in range(12)]
+        self.assertEqual(set(outputs), {0, 1})
+        self.assertTrue(all(left != right for left, right in zip(outputs, outputs[1:])))
+
+    def test_random_reset_replays_from_start_and_old_call_signature_still_works(self):
+        for index in range(5):
+            self.make_image(f"{index}.png")
+        reference = Node()
+        expected = [reference.load_image(str(self.folder), seed=41)["result"][4] for _ in range(5)]
+        # All existing positional inputs retain their old positions; reset is optional.
+        old_call = self.node.load_image(str(self.folder), "随机", 41, False, 0, 0, False, "#FFFFFF")
+        self.assertEqual(old_call["result"][4], expected[0])
+        self.load(seed=41)
+        reset = [self.load(seed=41, 随机重置标记=1)["result"][4] for _ in range(5)]
+        self.assertEqual(reset, expected)
+        self.assertEqual(self.load(seed=41, 随机重置标记=2)["result"][4], expected[0])
+
+    def test_irrelevant_controls_do_not_reset_random_playlist(self):
+        for index in range(5):
+            self.make_image(f"{index}.png")
+        reference = Node()
+        expected = [reference.load_image(str(self.folder), seed=13)["result"][4] for _ in range(5)]
+        actual = [self.load(seed=13, 顺序起始索引=index, 顺序重置标记=index,
+                            填充透明区域=bool(index % 2), 填充颜色=f"#{index:06x}")["result"][4]
+                  for index in range(5)]
+        self.assertEqual(actual, expected)
+
+    def test_random_playlist_rebuilds_for_file_list_folder_and_scan_changes(self):
+        for index in range(3):
+            self.make_image(f"{index}.png")
+
+        def compare_fresh(folder, recursive=False):
+            reference = Node()
+            count = len(module.scan_images(folder, recursive))
+            expected = [reference.load_image(str(folder), seed=9, 包含子文件夹=recursive)["result"][3]
+                        for _ in range(count)]
+            actual = [self.node.load_image(str(folder), seed=9, 包含子文件夹=recursive)["result"][3]
+                      for _ in range(count)]
+            self.assertEqual(actual, expected)
+
+        self.load(seed=9)
+        self.make_image("3.png")
+        compare_fresh(self.folder)
+        (self.folder / "0.png").unlink()
+        (self.folder / "1.png").rename(self.folder / "renamed.png")
+        compare_fresh(self.folder)
+        nested = self.make_image("child/a.png").parent
+        self.make_image("child/b.png")
+        compare_fresh(self.folder, recursive=True)
+        compare_fresh(nested)
+        compare_fresh(self.folder)
+
+    def test_successful_mode_switch_restarts_random_playlist(self):
+        for index in range(5):
+            self.make_image(f"{index}.png")
+        expected = [self.load(seed=72)["result"][4] for _ in range(5)]
+        self.load(seed=72)
+        self.assertEqual(self.load(读取方式="顺序")["result"][4], 0)
+        actual = [self.load(seed=72)["result"][4] for _ in range(5)]
+        self.assertEqual(actual, expected)
+        self.assertEqual(self.load(读取方式="顺序")["result"][4], 0)
+
+    def test_random_failures_keep_pending_image_even_after_seed_changes(self):
+        for index in range(3):
+            self.make_image(f"{index}.png")
+        for completed in (0, 1, 3):  # First image, middle of a round, first image of next round.
+            for stage in ("decode", "tensor", "preview", "interrupt"):
+                with self.subTest(completed=completed, stage=stage):
+                    self.node = Node()
+                    reference = Node()
+                    for _ in range(completed):
+                        self.load(seed=17)
+                        reference.load_image(str(self.folder), seed=17)
+                    expected = reference.load_image(str(self.folder), seed=41)["result"][4]
+                    if stage == "decode":
+                        failure = patch.object(module, "read_image", side_effect=OSError("cannot read"))
+                    elif stage == "tensor":
+                        failure = patch.object(sys.modules["torch"], "from_numpy", side_effect=OSError("cannot convert"))
+                    elif stage == "preview":
+                        failure = patch.object(module, "save_preview", side_effect=OSError("cannot preview"))
+                    else:
+                        failure = patch.object(module, "read_image", side_effect=Interrupted)
+                    with failure, self.assertRaises(Interrupted if stage == "interrupt" else OSError):
+                        self.load(seed=41)
+                    self.assertEqual(self.load(seed=87)["result"][4], expected)
+                    # Subsequent items also remain in the same queue after retrying.
+                    remaining = 2 if completed in (0, 3) else 1
+                    for _ in range(remaining):
+                        self.assertEqual(self.load(seed=99)["result"][4],
+                                         reference.load_image(str(self.folder), seed=41)["result"][4])
 
     def test_sequence_wraps_and_seed_does_not_reset_it(self):
         for name in ("1.png", "10.png", "2.png"):
@@ -280,7 +410,8 @@ class FolderImageTests(unittest.TestCase):
                 self.load(填充透明区域=True, 填充颜色=value)
         for options in ({"seed": -1}, {"seed": True}, {"seed": 2**64}, {"seed": 0.5},
                         {"读取方式": "other"}, {"包含子文件夹": "false"}, {"填充透明区域": "false"},
-                        {"顺序起始索引": -1}, {"顺序重置标记": -1}):
+                        {"顺序起始索引": -1}, {"顺序重置标记": -1}, {"随机重置标记": -1},
+                        {"随机重置标记": True}, {"随机重置标记": 0.5}, {"随机重置标记": 2**31}):
             with self.subTest(options=options), self.assertRaises(ValueError):
                 self.load(**options)
         self.assertFalse(self.temp.exists())

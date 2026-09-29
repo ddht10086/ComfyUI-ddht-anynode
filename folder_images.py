@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-only
-"""Read one local image per execution, with seeded selection and native preview."""
+"""Read one local image per execution, with a seeded shuffle playlist and preview."""
 
 from __future__ import annotations
 
@@ -159,10 +159,44 @@ def _nonnegative_integer(value, name, maximum):
         raise ValueError(f"{name} 必须是 0～{maximum} 之间的整数。")
 
 
+class _ShufflePlaylist:
+    """A shuffle bag: reserve an item before I/O, consume it only on success."""
+
+    def __init__(self, signature):
+        self.signature = signature
+        self.order = ()
+        self.position = 0
+        self.round = 0
+        self.last_index = None
+
+    def select(self, count, seed):
+        if self.position == len(self.order):
+            # Fixed seeds reproduce the complete run from a fresh playlist,
+            # while each round has its own shuffle. Changing the widget seed
+            # affects only the next round, never an unfinished playlist.
+            round_seed = seed if self.round == 0 else f"DDHT_FolderImage:{seed}:{self.round}"
+            rng = random.Random(round_seed)
+            order = list(range(count))
+            rng.shuffle(order)
+            if count > 1 and order[0] == self.last_index:
+                swap = rng.randrange(1, count)
+                order[0], order[swap] = order[swap], order[0]
+            self.order = tuple(order)
+            self.position = 0
+            self.round += 1
+        # Retain even a newly generated order if loading/preview later fails.
+        return self.order[self.position]
+
+    def advance(self):
+        self.last_index = self.order[self.position]
+        self.position += 1
+
+
 class DDHTFolderImage:
     def __init__(self):
         self._sequence_signature = None
         self._next_index = 0
+        self._shuffle = None
         self._lock = threading.Lock()
 
     @classmethod
@@ -171,7 +205,7 @@ class DDHTFolderImage:
             "文件夹路径": ("STRING", {"default": "", "tooltip": "运行 ComfyUI 的机器上的文件夹；支持中文、空格和带引号的路径。"}),
             "读取方式": (["随机", "顺序"], {"default": "随机"}),
             "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "control_after_generate": True,
-                             "tooltip": "仅随机模式使用。相同文件列表与种子选中同一张图片；randomize 可每次更新种子。"}),
+                             "tooltip": "用于生成随机播放列表；当前轮播完后才读取新种子。固定种子也会逐张前进，整轮不重复。"}),
             "包含子文件夹": ("BOOLEAN", {"default": False}),
             "顺序起始索引": ("INT", {"default": 0, "min": 0, "max": 0x7fffffff,
                                 "tooltip": "从 0 开始，按文件名自然排序逐次读取，读完后循环。超出图片数时取余。"}),
@@ -179,6 +213,10 @@ class DDHTFolderImage:
                                 "tooltip": "修改此数值，下一次顺序读取就从起始索引重新开始；保持不变则继续。"}),
             "填充透明区域": ("BOOLEAN", {"default": False, "tooltip": "开启时将透明/半透明区域与填充颜色合成；关闭时透明度输出到 MASK。"}),
             "填充颜色": ("STRING", {"default": "#FFFFFF", "tooltip": "#RRGGBB 或 #RGB；例如白色 #FFFFFF、黑色 #000000、绿色 #00FF00。"}),
+        }, "optional": {
+            # Appended to preserve every existing widget's serialized position.
+            "随机重置标记": ("INT", {"default": 0, "min": 0, "max": 0x7fffffff,
+                                "tooltip": "修改此数值，下一次随机读取会使用当时的 seed 重建播放列表；保持不变则继续。"}),
         }}
 
     RETURN_TYPES = ("IMAGE", "MASK", "STRING", "STRING", "INT", "INT")
@@ -186,14 +224,14 @@ class DDHTFolderImage:
     FUNCTION = "load_image"
     CATEGORY = "DDHT/Image"
     OUTPUT_NODE = True  # Can also run on its own to preview the selected file.
-    DESCRIPTION = "每次执行从本地文件夹读取一张图片；支持种子随机、顺序循环和透明区域填色。"
+    DESCRIPTION = "每次执行从本地文件夹读取一张图片；随机模式按洗牌列表逐张输出，整轮不重复，读完重新洗牌。"
 
     @classmethod
     def IS_CHANGED(cls, **kwargs):
         return float("nan")  # Folder contents and sequential position change outside inputs.
 
     def load_image(self, 文件夹路径, 读取方式="随机", seed=0, 包含子文件夹=False,
-                   顺序起始索引=0, 顺序重置标记=0, 填充透明区域=False, 填充颜色="#FFFFFF"):
+                   顺序起始索引=0, 顺序重置标记=0, 填充透明区域=False, 填充颜色="#FFFFFF", 随机重置标记=0):
         import torch
         from comfy import model_management
 
@@ -206,14 +244,19 @@ class DDHTFolderImage:
         _nonnegative_integer(seed, "种子", 0xffffffffffffffff)
         _nonnegative_integer(顺序起始索引, "顺序起始索引", 0x7fffffff)
         _nonnegative_integer(顺序重置标记, "顺序重置标记", 0x7fffffff)
+        _nonnegative_integer(随机重置标记, "随机重置标记", 0x7fffffff)
         color = parse_color(填充颜色) if 填充透明区域 else (255, 255, 255)
         folder = resolve_folder(文件夹路径)
         with self._lock:
             files = scan_images(folder, 包含子文件夹, check_interrupt)
-            signature = (str(folder), 包含子文件夹, 顺序起始索引, 顺序重置标记,
-                         tuple(path.relative_to(folder).as_posix() for path in files))
+            file_signature = (str(folder), 包含子文件夹,
+                              tuple(path.relative_to(folder).as_posix() for path in files))
+            signature = (file_signature, 顺序起始索引, 顺序重置标记)
             if 读取方式 == "随机":
-                index = random.Random(seed).randrange(len(files))
+                shuffle_signature = (file_signature, 随机重置标记)
+                if self._shuffle is None or self._shuffle.signature != shuffle_signature:
+                    self._shuffle = _ShufflePlaylist(shuffle_signature)
+                index = self._shuffle.select(len(files), seed)
             else:
                 index = (self._next_index if signature == self._sequence_signature else 顺序起始索引) % len(files)
             check_interrupt()
@@ -227,7 +270,9 @@ class DDHTFolderImage:
             if 读取方式 == "顺序":
                 self._sequence_signature = signature
                 self._next_index = (index + 1) % len(files)
+                self._shuffle = None
             else:
+                self._shuffle.advance()
                 self._sequence_signature = None
             return {"ui": {"images": [ui_image]},
                     "result": (image_tensor, mask_tensor, path.name, str(path), index, len(files))}
