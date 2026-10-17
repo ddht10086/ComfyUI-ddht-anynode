@@ -16,6 +16,7 @@ import uuid
 
 
 SCHEMA_VERSION = 1
+FINGERPRINT_CACHE_VERSION = 1
 ALGORITHM = "successful_draw_age_linear_v1"
 LOGGER = logging.getLogger("DDHT.FolderImages")
 
@@ -64,13 +65,64 @@ def fingerprint_file(path, check_interrupt=lambda: None):
         raise RuntimeError(f"无法读取图片内容指纹，请检查文件及权限：{path.name}") from error
 
 
-def build_manifest(folder, files, check_interrupt):
-    return [{"relative_path": path.relative_to(folder).as_posix(),
-             **fingerprint_file(path, check_interrupt)} for path in files]
+def _path_signature(path):
+    # Only compare these values with other path.stat() snapshots, never fstat().
+    try:
+        return list(_stat_key(path.stat()))
+    except OSError as error:
+        raise RuntimeError(f"无法读取图片文件属性，请检查文件及权限：{path.name}") from error
+
+
+def _cached_images(state, folder, files, recursive, reset_marker):
+    """Trust a cache only for a valid document with exactly the same file list."""
+    if not isinstance(state, dict) or state.get("fingerprint_cache_version") != FINGERPRINT_CACHE_VERSION:
+        return {}
+    images = state.get("images")
+    if not isinstance(images, list) or len(images) != len(files):
+        return {}  # Any count change must rehash every remaining/new image.
+    cached = {}
+    for item in images:
+        if not isinstance(item, dict) or not isinstance(item.get("relative_path"), str):
+            return {}
+        name, signature, digest = item["relative_path"], item.get("stat_signature"), item.get("sha256")
+        if (name in cached or not _integer(item.get("size"))
+                or not isinstance(signature, list) or len(signature) != 5
+                or any(type(value) is not int for value in signature) or signature[2] != item["size"]
+                or not isinstance(digest, str) or len(digest) != 64
+                or any(char not in "0123456789abcdef" for char in digest)):
+            return {}
+        cached[name] = item
+    names = [path.relative_to(folder).as_posix() for path in files]
+    if set(names) != set(cached):
+        return {}  # Also handle rename and remove+add with unchanged count.
+    manifest = [{key: cached[name][key] for key in ("relative_path", "size", "sha256")} for name in names]
+    if _rebuild_reason(state, folder, recursive, manifest, reset_marker) is not None:
+        return {}
+    return cached
+
+
+def build_manifest(folder, files, check_interrupt, cached=None):
+    manifest = []
+    for path in files:
+        check_interrupt()
+        name = path.relative_to(folder).as_posix()
+        signature = _path_signature(path)
+        previous = (cached or {}).get(name)
+        if previous is not None and previous["stat_signature"] == signature:
+            fingerprint = {key: previous[key] for key in ("size", "sha256")}
+        else:
+            fingerprint = fingerprint_file(path, check_interrupt)
+            if signature != _path_signature(path):
+                raise RuntimeError(f"图片在扫描期间发生变化，请重新执行：{path.name}")
+        manifest.append({"relative_path": name, **fingerprint, "stat_signature": signature})
+    return manifest
 
 
 def _manifest_digest(manifest):
-    encoded = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    # Metadata-only changes refresh the cache without resetting usage weights.
+    # Keep the original digest format so old documents retain their history.
+    content = [{key: item[key] for key in ("relative_path", "size", "sha256")} for item in manifest]
+    encoded = json.dumps(content, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
 
@@ -154,6 +206,7 @@ def _new_document(folder, recursive, manifest, reset_marker, reason):
     now = _now()
     state = {
         "schema_version": SCHEMA_VERSION, "algorithm": ALGORITHM,
+        "fingerprint_cache_version": FINGERPRINT_CACHE_VERSION,
         "folder": canonical_folder(folder), "recursive": recursive,
         "generation_id": uuid.uuid4().hex, "rebuild_reason": reason,
         "created_at": now, "updated_at": now, "manifest_sha256": _manifest_digest(manifest),
@@ -235,8 +288,9 @@ def run_weighted(folder, files, recursive, seed, reset_marker, state_directory,
     """Run consume(index), then atomically commit history; failures don't count as uses."""
     path = state_path_for(folder, state_directory)
     with _document_lock(path, check_interrupt):
-        manifest = build_manifest(folder, files, check_interrupt)
         state = _load_document(path)
+        cached = _cached_images(state, folder, files, recursive, reset_marker)
+        manifest = build_manifest(folder, files, check_interrupt, cached)
         reason = "first_use" if state is None else _rebuild_reason(state, folder, recursive, manifest, reset_marker)
         if reason:
             state = _new_document(folder, recursive, manifest, reset_marker, reason)
@@ -249,7 +303,13 @@ def run_weighted(folder, files, recursive, seed, reset_marker, state_directory,
         result = consume(index)
         check_interrupt()
         if fingerprint_file(files[index], check_interrupt) != {key: manifest[index][key] for key in ("size", "sha256")}:
-            raise RuntimeError("所选图片在读取期间被修改，请重新执行；本次未更新使用权重。")
+            if _path_signature(files[index]) == manifest[index]["stat_signature"]:
+                # Bytes changed while all cached attributes stayed identical.
+                # Invalidate the cache so retrying can recover without a manual
+                # reset; do not count the failed output as a successful use.
+                state.pop("fingerprint_cache_version", None)
+                _write_document(path, state)
+            raise RuntimeError("所选图片与扫描记录不一致，可能在读取期间被修改，请重新执行；本次未更新使用权重。")
         state["total_draws"] += 1
         now = _now()
         selected = next(item for item in state["images"] if item["relative_path"] == manifest[index]["relative_path"])
@@ -258,6 +318,10 @@ def run_weighted(folder, files, recursive, seed, reset_marker, state_directory,
         selected["last_used_at"] = now
         state["updated_at"] = now
         state["last_seed"] = seed
+        signatures = {item["relative_path"]: item["stat_signature"] for item in manifest}
+        for item in state["images"]:
+            item["stat_signature"] = signatures[item["relative_path"]]
+        state["fingerprint_cache_version"] = FINGERPRINT_CACHE_VERSION
         _rank_images(state)
         _write_document(path, state)
         return result, str(path)

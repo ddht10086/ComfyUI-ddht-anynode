@@ -143,6 +143,106 @@ class WeightedFolderTests(unittest.TestCase):
             self.assertEqual(item["weight"], total - item["last_used_draw"] + 1)
             self.assertEqual(len(item["sha256"]), 64)
 
+    def assert_scan_hashes(self, spy, expected_names):
+        # The final hash is always the selected image's post-read validation.
+        scanned = [call.args[0].name for call in spy.call_args_list[:-1]]
+        self.assertCountEqual(scanned, expected_names)
+
+    def test_unchanged_folder_reuses_persisted_hashes(self):
+        with patch.object(state_module, "fingerprint_file", wraps=state_module.fingerprint_file) as spy:
+            self.run_draw()
+        self.assert_scan_hashes(spy, ["0.png", "1.png", "2.png"])
+        first = self.document()
+        for _ in range(3):
+            with patch.object(state_module, "fingerprint_file", wraps=state_module.fingerprint_file) as spy:
+                self.run_draw()
+            self.assertEqual(spy.call_count, 1)
+            self.assertEqual(self.document()["generation_id"], first["generation_id"])
+        self.assertEqual(self.document()["total_draws"], 4)
+
+    def test_metadata_only_change_refreshes_cache_without_reset(self):
+        self.run_draw()
+        previous = self.document()["generation_id"]
+        path = self.folder / "0.png"
+        stat = path.stat()
+        os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1000000000))
+        with patch.object(state_module, "fingerprint_file", wraps=state_module.fingerprint_file) as spy:
+            self.run_draw()
+        self.assert_scan_hashes(spy, ["0.png"])
+        self.assertEqual(self.document()["generation_id"], previous)
+        self.assertEqual(self.document()["total_draws"], 2)
+        with patch.object(state_module, "fingerprint_file", wraps=state_module.fingerprint_file) as spy:
+            self.run_draw()
+        self.assertEqual(spy.call_count, 1)
+
+    def test_legacy_document_adds_cache_without_losing_history(self):
+        self.run_draw()
+        state = self.document()
+        state.pop("fingerprint_cache_version")
+        for item in state["images"]:
+            item.pop("stat_signature")
+        self.document_path().write_text(json.dumps(state), encoding="utf-8")
+        with patch.object(state_module, "fingerprint_file", wraps=state_module.fingerprint_file) as spy:
+            self.run_draw()
+        self.assert_scan_hashes(spy, ["0.png", "1.png", "2.png"])
+        self.assertEqual(self.document()["generation_id"], state["generation_id"])
+        self.assertEqual(self.document()["total_draws"], 2)
+        with patch.object(state_module, "fingerprint_file", wraps=state_module.fingerprint_file) as spy:
+            self.run_draw()
+        self.assertEqual(spy.call_count, 1)
+
+    def test_invalid_cache_rehashes_without_discarding_valid_weights(self):
+        self.run_draw()
+        for damage in ("missing", "malformed", "old_version"):
+            with self.subTest(damage=damage):
+                state = self.document()
+                if damage == "missing":
+                    state["images"][0].pop("stat_signature")
+                elif damage == "malformed":
+                    state["images"][0]["stat_signature"] = ["invalid"] * 5
+                else:
+                    state["fingerprint_cache_version"] = -1
+                self.document_path().write_text(json.dumps(state), encoding="utf-8")
+                with patch.object(state_module, "fingerprint_file", wraps=state_module.fingerprint_file) as spy:
+                    self.run_draw()
+                self.assert_scan_hashes(spy, ["0.png", "1.png", "2.png"])
+                self.assertEqual(self.document()["generation_id"], state["generation_id"])
+                self.assertEqual(self.document()["total_draws"], state["total_draws"] + 1)
+
+    def test_failed_output_does_not_commit_refreshed_metadata(self):
+        self.run_draw()
+        before = self.document_path().read_bytes()
+        path = self.folder / "0.png"
+        stat = path.stat()
+        os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1000000000))
+        with self.assertRaisesRegex(RuntimeError, "decode failed"):
+            self.run_draw(consume=Mock(side_effect=RuntimeError("decode failed")))
+        self.assertEqual(self.document_path().read_bytes(), before)
+        with patch.object(state_module, "fingerprint_file", wraps=state_module.fingerprint_file) as spy:
+            self.run_draw()
+        self.assert_scan_hashes(spy, ["0.png"])
+
+    def test_hidden_content_change_invalidates_cache_and_recovers_on_retry(self):
+        self.run_draw()
+        previous = self.document()
+        signatures = {item["relative_path"]: item["stat_signature"] for item in previous["images"]}
+        path = self.folder / "0.png"
+        path.write_bytes(b"b" * path.stat().st_size)
+        # Model a filesystem where every cached attribute remains unchanged.
+        with patch.object(state_module, "_path_signature", side_effect=lambda path: signatures[path.name]), \
+                patch.object(state_module, "_weighted_index", return_value=0):
+            with self.assertRaisesRegex(RuntimeError, "读取期间被修改"):
+                self.run_draw()
+            failed = self.document()
+            self.assertEqual(failed["total_draws"], previous["total_draws"])
+            self.assertEqual(failed["images"], previous["images"])
+            self.assertNotIn("fingerprint_cache_version", failed)
+            with patch.object(state_module, "fingerprint_file", wraps=state_module.fingerprint_file) as spy:
+                self.run_draw()
+            self.assert_scan_hashes(spy, ["0.png", "1.png", "2.png"])
+        self.assertNotEqual(self.document()["generation_id"], previous["generation_id"])
+        self.assertEqual(self.document()["total_draws"], 1)
+
     def test_document_ranks_every_image_and_updates_only_selected_history(self):
         index, path = self.run_draw()
         state = self.document()
@@ -214,29 +314,34 @@ class WeightedFolderTests(unittest.TestCase):
                    lambda: (self.folder / "0.png").rename(self.folder / "renamed.png")]
         for change in changes:
             change()
-            self.run_draw()
+            with patch.object(state_module, "fingerprint_file", wraps=state_module.fingerprint_file) as spy:
+                self.run_draw()
+            self.assert_scan_hashes(spy, [path.name for path in self.folder.glob("*.png")])
             state = self.document()
             self.assertNotEqual(state["generation_id"], previous)
             self.assertEqual(state["total_draws"], 1)
             self.assertEqual(state["rebuild_reason"], "image_list_or_content_changed")
             previous = state["generation_id"]
         self.image("child/child.png")
-        self.run_draw(recursive=True)
+        with patch.object(state_module, "fingerprint_file", wraps=state_module.fingerprint_file) as spy:
+            self.run_draw(recursive=True)
+        self.assert_scan_hashes(spy, ["renamed.png", "1.png", "2.png", "child.png"])
         self.assertNotEqual(self.document()["generation_id"], previous)
         self.assertEqual(self.document()["image_count"], 4)
         self.assertEqual(len(list(self.documents.glob("*.json"))), 1)
 
-    def test_same_name_size_and_mtime_content_change_rebuilds(self):
+    def test_same_name_and_size_content_change_only_rehashes_changed_image(self):
         path = self.folder / "0.png"
         path.write_bytes(b"AAAA")
         self.run_draw()
         previous = self.document()["generation_id"]
         before = path.stat()
         path.write_bytes(b"BBBB")
-        os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+        os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns + 1000000000))
         self.assertEqual(path.stat().st_size, before.st_size)
-        self.assertEqual(path.stat().st_mtime_ns, before.st_mtime_ns)
-        self.run_draw()
+        with patch.object(state_module, "fingerprint_file", wraps=state_module.fingerprint_file) as spy:
+            self.run_draw()
+        self.assert_scan_hashes(spy, ["0.png"])
         self.assertNotEqual(self.document()["generation_id"], previous)
         self.assertEqual(self.document()["total_draws"], 1)
 
@@ -253,9 +358,13 @@ class WeightedFolderTests(unittest.TestCase):
     def test_reset_marker_creates_new_generation_but_seed_change_does_not(self):
         self.run_draw()
         previous = self.document()["generation_id"]
-        self.run_draw(seed=8)
+        with patch.object(state_module, "fingerprint_file", wraps=state_module.fingerprint_file) as spy:
+            self.run_draw(seed=8)
+        self.assertEqual(spy.call_count, 1)
         self.assertEqual(self.document()["generation_id"], previous)
-        self.run_draw(seed=8, reset=1)
+        with patch.object(state_module, "fingerprint_file", wraps=state_module.fingerprint_file) as spy:
+            self.run_draw(seed=8, reset=1)
+        self.assert_scan_hashes(spy, ["0.png", "1.png", "2.png"])
         self.assertNotEqual(self.document()["generation_id"], previous)
         self.assertEqual(self.document()["total_draws"], 1)
         self.assertEqual(self.document()["rebuild_reason"], "manual_reset")
@@ -342,8 +451,16 @@ m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
 folder, documents = Path(sys.argv[2]), Path(sys.argv[3])
 files = sorted(folder.glob("*.png"))
+hashes = 0
+original = m.fingerprint_file
+def tracked(*args, **kwargs):
+    global hashes
+    hashes += 1
+    return original(*args, **kwargs)
+m.fingerprint_file = tracked
 for _ in range(8):
     m.run_weighted(folder, files, False, 0, 0, documents, lambda index: index)
+print(hashes)
 '''
         processes = [subprocess.Popen([sys.executable, "-c", script, str(ROOT / "folder_random_state.py"),
                                        str(self.folder), str(self.documents)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -352,6 +469,7 @@ for _ in range(8):
             for process in processes:
                 stdout, stderr = process.communicate(timeout=20)
                 self.assertEqual(process.returncode, 0, stderr.decode())
+                self.assertEqual(stdout.decode().strip(), "8")
         finally:
             for process in processes:
                 if process.poll() is None:
