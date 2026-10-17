@@ -1,6 +1,7 @@
 """Real JSON, hashing, locks and subprocess persistence; no GPU required."""
 
 import importlib
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -35,6 +36,70 @@ class Tensor:
 
     def unsqueeze(self, axis):
         return Tensor(np.expand_dims(self.array, axis))
+
+
+class FingerprintTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.path = Path(temporary.name) / "9989.png"
+        self.path.write_bytes(b"a" * (1024 * 1024 + 16))
+
+    def test_modification_during_hash_is_rejected(self):
+        before = self.path.stat()
+        checks = 0
+
+        def modify_after_first_chunk():
+            nonlocal checks
+            checks += 1
+            if checks == 2:
+                with self.path.open("r+b") as file:
+                    file.write(b"b")
+                os.utime(self.path, ns=(before.st_atime_ns, before.st_mtime_ns + 1000000000))
+
+        with self.assertRaisesRegex(RuntimeError, "图片在扫描期间发生变化"):
+            state_module.fingerprint_file(self.path, modify_after_first_chunk)
+        # Once stable, the actual new bytes are accepted rather than skipped.
+        self.assertEqual(state_module.fingerprint_file(self.path)["sha256"],
+                         hashlib.sha256(self.path.read_bytes()).hexdigest())
+
+    def test_handle_ctime_change_is_still_rejected(self):
+        original_fstat = os.fstat
+        calls = 0
+
+        def changed_ctime(fd):
+            nonlocal calls
+            calls += 1
+            stat = original_fstat(fd)
+            values = {name: getattr(stat, name) for name in dir(stat) if name.startswith("st_")}
+            if calls >= 2:
+                values["st_ctime_ns"] += 1000000000
+            return types.SimpleNamespace(**values)
+
+        with patch.object(state_module.os, "fstat", side_effect=changed_ctime):
+            with self.assertRaisesRegex(RuntimeError, "图片在扫描期间发生变化"):
+                state_module.fingerprint_file(self.path)
+
+    @unittest.skipIf(os.name == "nt", "Windows may deny replacing an open file")
+    def test_same_size_and_mtime_path_replacement_after_read_is_rejected(self):
+        replacement = self.path.with_name("replacement.png")
+        replacement.write_bytes(b"b" * self.path.stat().st_size)
+        before = self.path.stat()
+        os.utime(replacement, ns=(before.st_atime_ns, before.st_mtime_ns))
+        original_fstat = os.fstat
+        calls = 0
+
+        def replace_after_read(fd):
+            nonlocal calls
+            calls += 1
+            stat = original_fstat(fd)
+            if calls == 2:
+                os.replace(replacement, self.path)
+            return stat
+
+        with patch.object(state_module.os, "fstat", side_effect=replace_after_read):
+            with self.assertRaisesRegex(RuntimeError, "图片在扫描期间发生变化"):
+                state_module.fingerprint_file(self.path)
 
 
 class WeightedFolderTests(unittest.TestCase):
@@ -92,6 +157,32 @@ class WeightedFolderTests(unittest.TestCase):
         self.run_draw(seed=123)
         self.assertEqual(self.document()["generation_id"], state["generation_id"])
         self.assert_document_consistent(self.document())
+
+    def test_windows_stat_fstat_differences_do_not_reset_history(self):
+        # Windows can expose creation time via stat and change time via fstat.
+        # Older builds can also expose different identity fields for each API.
+        self.run_draw()
+        initial = self.document()
+        original_fstat = os.fstat
+        for fields in ("ctime", "identity"):
+            with self.subTest(fields=fields):
+                def windows_fstat(fd):
+                    stat = original_fstat(fd)
+                    values = {name: getattr(stat, name) for name in dir(stat) if name.startswith("st_")}
+                    if fields == "ctime":
+                        values["st_ctime_ns"] += 1000000000
+                    else:
+                        values.update(st_dev=0, st_ino=0)
+                    return types.SimpleNamespace(**values)
+
+                total = self.document()["total_draws"]
+                with patch.object(state_module.os, "fstat", side_effect=windows_fstat):
+                    self.run_draw()
+                    self.run_draw()
+                state = self.document()
+                self.assertEqual(state["generation_id"], initial["generation_id"])
+                self.assertEqual(state["total_draws"], total + 2)
+                self.assert_document_consistent(state)
 
     def test_fixed_seed_reproduces_history_and_does_not_touch_global_rng(self):
         state = random.getstate()

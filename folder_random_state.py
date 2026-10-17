@@ -50,8 +50,15 @@ def fingerprint_file(path, check_interrupt=lambda: None):
                     break
                 digest.update(chunk)
             after = os.fstat(file.fileno())
-        if _stat_key(before) != _stat_key(after) or _stat_key(after) != _stat_key(path.stat()):
-            raise RuntimeError(f"图片在扫描期间发生变化，请重新执行：{path.name}")
+            check_interrupt()
+            # Keep both snapshots on the same API: Windows stat(path) may use
+            # creation time for ctime while fstat(fd) uses metadata change time.
+            # Reopen the path while the first handle is alive to also detect a
+            # file replaced at that path, including same-size/mtime replacements.
+            with path.open("rb") as current:
+                current_stat = os.fstat(current.fileno())
+            if _stat_key(before) != _stat_key(after) or _stat_key(after) != _stat_key(current_stat):
+                raise RuntimeError(f"图片在扫描期间发生变化，请重新执行：{path.name}")
         return {"size": after.st_size, "sha256": digest.hexdigest()}
     except OSError as error:
         raise RuntimeError(f"无法读取图片内容指纹，请检查文件及权限：{path.name}") from error
