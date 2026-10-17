@@ -73,7 +73,8 @@ class FolderImageTests(unittest.TestCase):
     def test_schema_registration_and_always_execute(self):
         self.assertIs(module.NODE_CLASS_MAPPINGS["DDHT_FolderImage"], Node)
         required = Node.INPUT_TYPES()["required"]
-        self.assertEqual(required["读取方式"][1]["default"], "随机")
+        self.assertEqual(required["读取方式"][1]["default"], "洗牌袋")
+        self.assertTrue({"独立均匀随机", "洗牌袋", "时间间隔加权随机", "顺序", "随机"}.issubset(required["读取方式"][0]))
         self.assertTrue(required["seed"][1]["control_after_generate"])
         self.assertFalse(required["填充透明区域"][1]["default"])
         self.assertEqual(list(required), ["文件夹路径", "读取方式", "seed", "包含子文件夹",
@@ -120,6 +121,24 @@ class FolderImageTests(unittest.TestCase):
             self.assertEqual(out["result"][5], 7)
         self.assertEqual(state, random.getstate())
         self.assertNotEqual(self.preview(outputs[0]), self.preview(outputs[1]))
+
+    def test_uniform_random_is_independent_and_does_not_create_weight_documents(self):
+        for index in range(7):
+            self.make_image(f"{index}.png")
+        state = random.getstate()
+        outputs = [self.load(读取方式="独立均匀随机", seed=1234) for _ in range(4)]
+        self.assertEqual({out["result"][4] for out in outputs}, {random.Random(1234).randrange(7)})
+        self.assertTrue(all(out["result"][6] == "" for out in outputs))
+        self.assertEqual(state, random.getstate())
+        self.assertFalse(list(self.root.rglob("*.json")))
+
+    def test_explicit_shuffle_bag_matches_legacy_random_name(self):
+        for index in range(4):
+            self.make_image(f"{index}.png")
+        other = Node()
+        expected = [self.load(seed=32)["result"][4] for _ in range(12)]
+        actual = [other.load_image(str(self.folder), 读取方式="洗牌袋", seed=32)["result"][4] for _ in range(12)]
+        self.assertEqual(actual, expected)
 
     def test_fixed_seed_reproduces_full_playlist_in_independent_nodes(self):
         for index in range(6):
