@@ -457,7 +457,8 @@ class FolderImageTests(unittest.TestCase):
         with patch.dict(sys.modules, stubs):
             package_spec.loader.exec_module(package)
         self.assertIs(package.NODE_CLASS_MAPPINGS["DDHT_FolderImage"], Node)
-        self.assertEqual(len(package.NODE_CLASS_MAPPINGS), 7)
+        self.assertIn("DDHT_LoadImage", package.NODE_CLASS_MAPPINGS)
+        self.assertEqual(len(package.NODE_CLASS_MAPPINGS), 8)
 
 
 if __name__ == "__main__":
